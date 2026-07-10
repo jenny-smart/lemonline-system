@@ -22,7 +22,6 @@ Turso 連線與資料存取層。
 """
 
 import os
-import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -377,21 +376,26 @@ def update_user_note(client, user_id, note):
 
 
 def get_user_tags(client, user_id):
+    # tags.id 是 integer、user_tags.tag_id 是 text,JOIN 時把 tags.id 轉字串才對得上
     rs = client.execute(
         "SELECT t.id, t.name, t.color FROM tags t "
-        "JOIN user_tags ut ON ut.tag_id = t.id WHERE ut.line_user_id = ?",
+        "JOIN user_tags ut ON ut.tag_id = CAST(t.id AS TEXT) WHERE ut.line_user_id = ?",
         [user_id],
     )
-    return [dict(zip(rs.columns, row)) for row in rs.rows]
+    result = [dict(zip(rs.columns, row)) for row in rs.rows]
+    for r in result:
+        r["id"] = str(r["id"])
+    return result
 
 
 def set_user_tags(client, user_id, tag_ids):
     """下標籤 —— 核心功能。整批覆蓋該用戶的標籤"""
     client.execute("DELETE FROM user_tags WHERE line_user_id = ?", [user_id])
+    now = _now()
     for tag_id in tag_ids:
         client.execute(
-            "INSERT OR IGNORE INTO user_tags (line_user_id, tag_id) VALUES (?, ?)",
-            [user_id, tag_id],
+            "INSERT OR IGNORE INTO user_tags (line_user_id, tag_id, tagged_at) VALUES (?, ?, ?)",
+            [user_id, str(tag_id), now],
         )
 
 
@@ -400,16 +404,25 @@ def set_user_tags(client, user_id, tag_ids):
 # ------------------------------------------------------------------
 def get_all_tags(client):
     rs = client.execute("SELECT * FROM tags ORDER BY name")
-    return [dict(zip(rs.columns, row)) for row in rs.rows]
+    tags = [dict(zip(rs.columns, row)) for row in rs.rows]
+    # tags.id 是 integer,統一轉成字串,與 user_tags.tag_id(text)及前端 key 一致
+    for t in tags:
+        t["id"] = str(t["id"])
+    return tags
 
 
 def create_tag(client, name, color, description=""):
-    tag_id = "tag_" + uuid.uuid4().hex[:8]
+    """
+    你既有的 tags 表主鍵 id 是 integer(自動遞增),所以不自己塞 id,
+    讓資料庫自動產生,再把新 id 查回來回傳(統一轉字串,方便前端與 user_tags 對應)。
+    """
+    now = _now()
     client.execute(
-        "INSERT INTO tags (id, name, color, description) VALUES (?, ?, ?, ?)",
-        [tag_id, name, color, description],
+        "INSERT INTO tags (name, color, description, created_at) VALUES (?, ?, ?, ?)",
+        [name, color, description, now],
     )
-    return tag_id
+    rs = client.execute("SELECT id FROM tags WHERE name = ? ORDER BY id DESC LIMIT 1", [name])
+    return str(rs.rows[0][0]) if rs.rows else None
 
 
 def update_tag(client, tag_id, name, color, description):
@@ -420,8 +433,12 @@ def update_tag(client, tag_id, name, color, description):
 
 
 def delete_tag(client, tag_id):
-    client.execute("DELETE FROM user_tags WHERE tag_id = ?", [tag_id])
-    client.execute("DELETE FROM tags WHERE id = ?", [tag_id])
+    client.execute("DELETE FROM user_tags WHERE tag_id = ?", [str(tag_id)])
+    # tags.id 是 integer,刪除時轉回整數比對
+    try:
+        client.execute("DELETE FROM tags WHERE id = ?", [int(tag_id)])
+    except (ValueError, TypeError):
+        client.execute("DELETE FROM tags WHERE id = ?", [tag_id])
 
 
 # ------------------------------------------------------------------
