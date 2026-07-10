@@ -114,7 +114,8 @@ class TursoHTTPClient:
         result_item = data["results"][0]
         if result_item.get("type") == "error":
             err = result_item.get("error", {})
-            raise RuntimeError(f"Turso error: {err.get('message', err)}")
+            msg = err.get("message", err)
+            raise RuntimeError(f"Turso error: {msg}\nSQL: {sql}")
 
         result = result_item["response"]["result"]
         columns = [c["name"] for c in result.get("cols", [])]
@@ -142,11 +143,39 @@ def ensure_schema(client):
     for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
         client.execute(stmt)
 
-    # 舊表可能沒有 note 欄位(CREATE TABLE IF NOT EXISTS 不會補欄位),補一次
+    # 既有的表可能欄位不齊(CREATE TABLE IF NOT EXISTS 遇到同名舊表不會補欄位),
+    # 逐一嘗試把缺的欄位補上。欄位已存在時 ALTER 會噴錯,忽略即可。
+    alters = [
+        "ALTER TABLE line_users ADD COLUMN note TEXT",
+        "ALTER TABLE line_users ADD COLUMN edited_name TEXT",
+        "ALTER TABLE line_users ADD COLUMN picture_url TEXT",
+        "ALTER TABLE line_users ADD COLUMN status_message TEXT",
+        "ALTER TABLE line_users ADD COLUMN first_seen_at TEXT",
+        "ALTER TABLE line_users ADD COLUMN last_seen_at TEXT",
+        "ALTER TABLE line_users ADD COLUMN message_count INTEGER DEFAULT 0",
+        "ALTER TABLE tags ADD COLUMN color TEXT DEFAULT '#06C755'",
+        "ALTER TABLE tags ADD COLUMN description TEXT",
+        "ALTER TABLE tags ADD COLUMN created_at TEXT",
+    ]
+    for a in alters:
+        try:
+            client.execute(a)
+        except Exception:
+            pass
+
+
+def describe_table(client, table):
+    """回傳某張表的欄位定義,用於診斷結構不符的問題。"""
     try:
-        client.execute("ALTER TABLE line_users ADD COLUMN note TEXT")
-    except Exception:
-        pass  # 欄位已存在時會噴錯,忽略即可
+        rs = client.execute(f"PRAGMA table_info({table})")
+        return [dict(zip(rs.columns, row)) for row in rs.rows]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def list_tables(client):
+    rs = client.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    return [row[0] for row in rs.rows]
 
 
 # ------------------------------------------------------------------
@@ -238,6 +267,76 @@ def upsert_user_seen(client, user_id, display_name):
             "VALUES (?, ?, ?, ?, 1)",
             [user_id, display_name, now, now],
         )
+
+
+def sync_users_from_messages(client):
+    """
+    從 line_messages 一次補齊 line_users:
+    凡是在訊息表出現過、但還沒進 line_users 的用戶,用其原始名稱 + line id 建進來,
+    並回填首次/最後互動時間與訊息數。已存在的用戶只更新原始名稱與統計,不動 edited_name/標籤/備註。
+
+    這讓「訊息一進來,用戶就出現在用戶列表」不必依賴 Cloudflare Worker,
+    每次開啟後台時自動對齊。
+    """
+    uid = COL["user_id"]
+    name = COL["display_name"]
+    ts = COL["received_at"]
+
+    # 以每個 user 為單位,算出原始名稱(取最新一筆的名稱)、首次/最後互動、訊息數
+    rs = client.execute(
+        f"""
+        SELECT
+            m.{uid} AS user_id,
+            MIN(m.{ts}) AS first_seen,
+            MAX(m.{ts}) AS last_seen,
+            COUNT(*) AS cnt
+        FROM {MESSAGES_TABLE} m
+        WHERE m.{uid} IS NOT NULL AND m.{uid} != ''
+        GROUP BY m.{uid}
+        """
+    )
+    agg = {row[0]: {"first": row[1], "last": row[2], "cnt": row[3]} for row in rs.rows}
+    if not agg:
+        return 0
+
+    # 每個 user 最新一筆訊息的原始名稱
+    name_rs = client.execute(
+        f"""
+        SELECT m.{uid}, m.{name}
+        FROM {MESSAGES_TABLE} m
+        JOIN (
+            SELECT {uid} AS u, MAX({ts}) AS mx
+            FROM {MESSAGES_TABLE}
+            WHERE {uid} IS NOT NULL AND {uid} != ''
+            GROUP BY {uid}
+        ) latest ON m.{uid} = latest.u AND m.{ts} = latest.mx
+        """
+    )
+    latest_name = {row[0]: row[1] for row in name_rs.rows}
+
+    # 已存在的用戶
+    existing_rs = client.execute("SELECT line_user_id FROM line_users")
+    existing_ids = {row[0] for row in existing_rs.rows}
+
+    inserted = 0
+    for user_id, stat in agg.items():
+        disp = latest_name.get(user_id) or "未知用戶"
+        if user_id in existing_ids:
+            # 已存在:只更新原始名稱與統計,保留後台編輯過的資料
+            client.execute(
+                "UPDATE line_users SET display_name = ?, first_seen_at = ?, "
+                "last_seen_at = ?, message_count = ? WHERE line_user_id = ?",
+                [disp, stat["first"], stat["last"], stat["cnt"], user_id],
+            )
+        else:
+            client.execute(
+                "INSERT INTO line_users (line_user_id, display_name, first_seen_at, last_seen_at, message_count) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [user_id, disp, stat["first"], stat["last"], stat["cnt"]],
+            )
+            inserted += 1
+
+    return inserted
 
 
 def get_users(client, keyword=None, tag_id=None):

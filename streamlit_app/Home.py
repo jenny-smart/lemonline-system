@@ -231,14 +231,26 @@ with tab_users:
     tags = db.get_all_tags(client)
     tag_options = {"all": "全部標籤"} | {t["id"]: t["name"] for t in tags}
 
-    c1, c2 = st.columns([3, 1])
+    # 每次開啟用戶頁時,自動把訊息裡出現過但還沒進用戶表的用戶補進來(用原始名稱+line id)
+    # 只在本 session 第一次進來時自動跑,避免每次互動都全表掃描
+    if not st.session_state.get("_users_synced"):
+        with st.spinner("同步用戶資料中..."):
+            db.sync_users_from_messages(client)
+        st.session_state["_users_synced"] = True
+
+    c1, c2, c3 = st.columns([3, 1, 1])
     u_keyword = c1.text_input("搜尋用戶名稱 / ID", key="u_kw")
     u_tag_filter = c2.selectbox("標籤篩選", list(tag_options.keys()), format_func=lambda k: tag_options[k], key="u_tag")
+    c3.write("")
+    if c3.button("🔄 重新同步", help="從訊息記錄重新補齊用戶清單"):
+        n = db.sync_users_from_messages(client)
+        st.success(f"同步完成，新增 {n} 位用戶")
+        st.rerun()
 
     users = db.get_users(client, keyword=u_keyword or None, tag_id=u_tag_filter)
 
     with st.container(border=True):
-        st.markdown(f"**用戶列表**　共 {len(users)} 位用戶　(新訊息進來會自動出現在這裡)")
+        st.markdown(f"**用戶列表**　共 {len(users)} 位用戶　(訊息一進來即以原始名稱+LINE ID 出現在這裡)")
         header = st.columns([1.6, 1.1, 1.1, 1.3, 1.6, 1, 1, 0.8])
         for col, label in zip(header, ["LINE ID", "原用戶名稱", "編輯後名稱", "標籤", "備註事項", "首次互動", "最後互動", "操作"]):
             col.markdown(f"**{label}**")
@@ -280,9 +292,12 @@ with tab_tags:
         desc = c3.text_input("描述(選填)", key="new_tag_desc")
         if st.button("建立標籤", key="create_tag_btn"):
             if name.strip():
-                db.create_tag(client, name.strip(), color, desc)
-                st.success(f"已建立標籤「{name}」")
-                st.rerun()
+                try:
+                    db.create_tag(client, name.strip(), color, desc)
+                    st.success(f"已建立標籤「{name}」")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"建立標籤失敗：{e}")
             else:
                 st.warning("請輸入標籤名稱")
 
@@ -302,3 +317,15 @@ with tab_tags:
                 if st.button("刪除", key=f"del_{tag['id']}"):
                     db.delete_tag(client, tag["id"])
                     st.rerun()
+
+    # ---- 資料庫診斷(排查結構問題用,確認正常後可移除) ----
+    with st.expander("🔧 資料庫診斷"):
+        st.caption("如果建立標籤/存檔失敗,這裡可看出實際的表結構")
+        try:
+            st.write("**現有資料表：**", db.list_tables(client))
+            for tbl in ("tags", "line_users", "user_tags", "message_status"):
+                st.write(f"**{tbl} 欄位：**")
+                st.json(db.describe_table(client, tbl))
+        except Exception as e:
+            st.error(f"診斷查詢失敗：{e}")
+
