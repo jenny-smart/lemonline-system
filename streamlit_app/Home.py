@@ -5,7 +5,11 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-sys.path.append(os.path.dirname(__file__))
+# db/ 可能在 repo 根目錄(本檔上一層),也可能跟本檔同層,兩層都加進 path 保險
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_here), _here):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from db import client as db  # noqa: E402
 
 st.set_page_config(page_title="檸檬家事 LINE 管理後台", page_icon="🍋", layout="wide")

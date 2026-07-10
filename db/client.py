@@ -1,23 +1,31 @@
 """
 db/client.py
-Turso (libSQL) 連線與資料存取層。
+Turso 連線與資料存取層。
+
+⚠️ 改版說明:
+   原本用 libsql_client 套件,但它跟 Streamlit Cloud 目前預設的 Python 3.14
+   不相容(WebSocket 握手失敗 / HTTP 回應解析 KeyError 都是這套件的 bug)。
+   而 Streamlit Cloud 的 Python 版本只能在第一次部署時選,runtime.txt 目前
+   會被平台忽略,所以與其等套件修復或砍掉重建 app,不如直接改用最基本的
+   requests 呼叫 Turso 的 HTTP Pipeline API,完全不依賴 aiohttp/asyncio,
+   跟 Python 版本無關,穩定很多。
 
 環境變數:
-  TURSO_DATABASE_URL   例如 libsql://line-lemon-db-jenny-smart.turso.io
+  TURSO_DATABASE_URL   例如 https://line-lemon-db-jenny-smart.turso.io
+                       (libsql:// 開頭也可以,程式會自動轉成 https://)
   TURSO_AUTH_TOKEN
 
-安裝: pip install libsql-client
+安裝: pip install requests
 
 ⚠️ 注意:MESSAGES_TABLE 底下的欄位名稱是「假設值」,
-   因為我沒辦法直接讀取你 Turso 裡 line_messages 的實際結構。
-   部署前請對照你現有的表,把下面 COLUMN MAP 改成正確欄位名稱。
+   請對照你 line_messages 的實際結構修改。
 """
 
 import os
 import uuid
 from datetime import datetime, timezone
 
-import libsql_client
+import requests
 
 # ------------------------------------------------------------------
 # 現有 line_messages 表的欄位對應 —— 請依實際結構修改
@@ -33,10 +41,94 @@ COL = {
 }
 
 
+class ResultSet:
+    def __init__(self, columns, rows):
+        self.columns = columns
+        self.rows = rows
+
+
+class TursoHTTPClient:
+    """用 Turso HTTP Pipeline API (/v2/pipeline) 取代 libsql_client。"""
+
+    def __init__(self, url, token):
+        # libsql:// 或 http:// 開頭都轉成 https://
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://"):]
+        elif url.startswith("http://"):
+            url = "https://" + url[len("http://"):]
+        self.base_url = url.rstrip("/")
+        self.token = token
+
+    @staticmethod
+    def _to_turso_value(v):
+        if v is None:
+            return {"type": "null"}
+        if isinstance(v, bool):
+            return {"type": "integer", "value": "1" if v else "0"}
+        if isinstance(v, int):
+            return {"type": "integer", "value": str(v)}
+        if isinstance(v, float):
+            return {"type": "float", "value": v}
+        return {"type": "text", "value": str(v)}
+
+    @staticmethod
+    def _from_turso_value(v):
+        if v is None:
+            return None
+        t = v.get("type")
+        val = v.get("value")
+        if t == "null":
+            return None
+        if t == "integer":
+            return int(val)
+        if t == "float":
+            return float(val)
+        return val  # text / blob(base64 字串) 原樣回傳
+
+    def execute(self, sql, args=None):
+        args = args or []
+        payload = {
+            "requests": [
+                {
+                    "type": "execute",
+                    "stmt": {
+                        "sql": sql,
+                        "args": [self._to_turso_value(a) for a in args],
+                    },
+                },
+                {"type": "close"},
+            ]
+        }
+        resp = requests.post(
+            f"{self.base_url}/v2/pipeline",
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        result_item = data["results"][0]
+        if result_item.get("type") == "error":
+            err = result_item.get("error", {})
+            raise RuntimeError(f"Turso error: {err.get('message', err)}")
+
+        result = result_item["response"]["result"]
+        columns = [c["name"] for c in result.get("cols", [])]
+        rows = [
+            [self._from_turso_value(cell) for cell in row]
+            for row in result.get("rows", [])
+        ]
+        return ResultSet(columns, rows)
+
+
 def get_client():
     url = os.environ["TURSO_DATABASE_URL"]
     token = os.environ["TURSO_AUTH_TOKEN"]
-    return libsql_client.create_client_sync(url=url, auth_token=token)
+    return TursoHTTPClient(url, token)
 
 
 def _now():
