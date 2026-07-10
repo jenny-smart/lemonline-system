@@ -76,6 +76,6 @@ streamlit run streamlit_app/Home.py
 ## 待辦
 
 - [ ] 確認 `db/client.py` 的 `COL` 對應到你實際的 `line_messages` 欄位
-- [x] 已改用 `requests` 直接打 Turso HTTP API,拿掉 `libsql_client`,不再受 Streamlit Cloud 的 Python 版本影響
+- [x] Python 版本釘在 3.11(見 `runtime.txt`),避免 libsql-client 與新版 Python 不相容
 - [ ] Worker 補上 `line_users` upsert，或跑一次性回填腳本
 - [ ] `python_app/`（如果有既有邏輯）要不要併入或保留，看你原本用途

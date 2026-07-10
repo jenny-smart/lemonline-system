@@ -14,9 +14,9 @@ CREATE TABLE IF NOT EXISTS line_users (
     note           TEXT               -- 客服備註事項
 );
 
--- 標籤主檔(id 為 integer 自動遞增,對齊既有表結構)
+-- 標籤主檔
 CREATE TABLE IF NOT EXISTS tags (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     color       TEXT DEFAULT '#06C755',
     description TEXT,
